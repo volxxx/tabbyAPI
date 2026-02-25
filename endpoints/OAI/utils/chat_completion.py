@@ -16,22 +16,43 @@ from common.networking import (
     get_generator_error,
     handle_request_error,
     DisconnectHandler,
+    request_disconnect_loop,
 )
 from common.utils import unwrap
 from endpoints.OAI.types.chat_completion import (
     ChatCompletionLogprobs,
+    ChatCompletionLogprob,
     ChatCompletionMessage,
     ChatCompletionRequest,
     ChatCompletionRespChoice,
+    ChatCompletionStreamChunk,
     ChatCompletionResponse,
+    ChatCompletionStreamChoice,
 )
 from endpoints.OAI.types.common import UsageStats
-from endpoints.OAI.utils.completion import _parse_gen_request_id
+from endpoints.OAI.utils.completion import _parse_gen_request_id, _stream_collector
+from endpoints.OAI.types.tools import NamedToolChoice, ToolCall
 from endpoints.OAI.utils.tools import (
     get_toolcall_tags,
     parse_toolcalls,
+    ToolCallProcessor,
+    TOOL_CALL_SCHEMA
 )
 from endpoints.OAI.utils.common_ import aggregate_usage_stats, get_usage_stats
+
+def _serialize_stream_chunk(chunk) -> str:
+    """Serialize a streaming chunk with OpenAI-compatible field handling.
+
+    Uses exclude_none=True to strip irrelevant null fields (tool_calls,
+    tool_call_id, logprobs, usage) while ensuring finish_reason is always
+    present on each choice (as null when not set), matching OpenAI's
+    observed streaming behavior.
+    """
+    d = chunk.model_dump(exclude_none=True)
+    for choice in d.get("choices", []):
+        if "finish_reason" not in choice:
+            choice["finish_reason"] = None
+    return json.dumps(d, ensure_ascii=False)
 
 
 def _start_in_reasoning_mode(prompt: str) -> bool:
@@ -189,6 +210,273 @@ def _compose_serialize_stream_usage_chunk(
     # Serialize
     s = json.dumps(data, ensure_ascii=False)  # TODO: Investigate ensure_ascii
     return s, data
+
+def _create_response(
+    request_id: str,
+    generations: List[dict],
+    model_name: Optional[str],
+    tool_call_format: str = "json",
+    tool_choice=None,
+):
+    """Create a chat completion response from the provided text."""
+
+    choices = []
+    for index, generation in enumerate(generations):
+        message = ChatCompletionMessage(
+            role="assistant", content=unwrap(generation.get("text"), "")
+        )
+
+        tool_calls_raw = generation.get("tool_calls")
+        if tool_calls_raw:
+            named_func = ""
+            if isinstance(tool_choice, NamedToolChoice):
+                named_func = tool_choice.function.name
+            parsed = ToolCallProcessor.parse(tool_calls_raw, format=tool_call_format, named_func=named_func)
+            if parsed:
+                message.tool_calls = parsed
+            else:
+                xlogger.warning(
+                    "Tool call text present but parsing returned no results "
+                    f"(format={tool_call_format})"
+                )
+
+        # Fallback: detect bare XML tool calls in content that were not
+        # caught by the two-pass system (model never emitted tool_start)
+        if (
+            tool_call_format in ("xml", "auto")
+            and not message.tool_calls
+            and message.content
+            and "<function=" in message.content
+        ):
+            xlogger.warning(
+                "Fallback: Detected bare XML function blocks in content "
+                "(tool_start was likely not emitted by model)"
+            )
+            remaining, parsed = ToolCallProcessor.extract_content_and_tools(
+                message.content
+            )
+            if parsed:
+                message.tool_calls = parsed
+                message.content = remaining if remaining else None
+
+        logprob_response = None
+
+        token_probs = unwrap(generation.get("token_probs"), {})
+        if token_probs:
+            logprobs = unwrap(generation.get("logprobs"), [])
+
+            collected_token_probs = []
+            for index, token in enumerate(token_probs.keys()):
+                top_logprobs = [
+                    ChatCompletionLogprob(token=token, logprob=logprob)
+                    for token, logprob in logprobs[index].items()
+                ]
+
+                collected_token_probs.append(
+                    ChatCompletionLogprob(
+                        token=token,
+                        logprob=token_probs[token],
+                        top_logprobs=top_logprobs,
+                    )
+                )
+
+            logprob_response = ChatCompletionLogprobs(content=collected_token_probs)
+
+        # Set finish reason
+        if message.tool_calls:
+            finish_reason = "tool_calls"
+        else:
+            finish_reason = generation.get("finish_reason", "stop")
+
+        choice = ChatCompletionRespChoice(
+            index=index,
+            finish_reason=finish_reason,
+            stop_str=generation.get("stop_str"),
+            message=message,
+            logprobs=logprob_response,
+        )
+
+        choices.append(choice)
+
+    final_generation = generations[-1]
+    prompt_tokens = unwrap(final_generation.get("prompt_tokens"), 0)
+    completion_tokens = unwrap(final_generation.get("gen_tokens"), 0)
+
+    response = ChatCompletionResponse(
+        id=f"cmpl-{request_id}",
+        choices=choices,
+        model=model_name,
+        usage=UsageStats(
+            prompt_tokens=prompt_tokens,
+            prompt_time=final_generation.get("prompt_time"),
+            prompt_tokens_per_sec=final_generation.get("prompt_tokens_per_sec"),
+            completion_tokens=completion_tokens,
+            completion_time=final_generation.get("gen_time"),
+            completion_tokens_per_sec=final_generation.get("gen_tokens_per_sec"),
+            total_tokens=prompt_tokens + completion_tokens,
+            total_time=final_generation.get("total_time"),
+        ),
+    )
+
+    return response
+
+def _create_stream_chunk(
+    request_id: str,
+    generation: Optional[dict] = None,
+    model_name: Optional[str] = None,
+    is_usage_chunk: bool = False,
+):
+    """Create a chat completion stream chunk from the provided text.
+
+    Note: Tool-call streaming is handled separately by
+    _build_tool_call_chunks() which emits the proper three-phase
+    OpenAI-standard chunk sequence.
+    """
+
+    index = generation.get("index")
+    choices = []
+    usage_stats = None
+
+    if is_usage_chunk:
+        prompt_tokens = unwrap(generation.get("prompt_tokens"), 0)
+        completion_tokens = unwrap(generation.get("gen_tokens"), 0)
+
+        usage_stats = UsageStats(
+            prompt_tokens=prompt_tokens,
+            prompt_time=generation.get("prompt_time"),
+            prompt_tokens_per_sec=generation.get("prompt_tokens_per_sec"),
+            completion_tokens=completion_tokens,
+            completion_time=generation.get("gen_time"),
+            completion_tokens_per_sec=generation.get("gen_tokens_per_sec"),
+            total_tokens=prompt_tokens + completion_tokens,
+            total_time=generation.get("total_time"),
+        )
+    elif "finish_reason" in generation:
+        finish_reason = generation.get("finish_reason")
+        choice = ChatCompletionStreamChoice(
+            index=index, finish_reason=finish_reason, delta={}
+        )
+        choices.append(choice)
+    else:
+        message = ChatCompletionMessage(
+            role="assistant", content=unwrap(generation.get("text"), "")
+        )
+
+        logprob_response = None
+
+        token_probs = unwrap(generation.get("token_probs"), {})
+        if token_probs:
+            logprobs = unwrap(generation.get("logprobs"), {})
+            top_logprobs = [
+                ChatCompletionLogprob(token=token, logprob=logprob)
+                for token, logprob in logprobs.items()
+            ]
+
+            generated_token = next(iter(token_probs))
+            token_prob_response = ChatCompletionLogprob(
+                token=generated_token,
+                logprob=token_probs[generated_token],
+                top_logprobs=top_logprobs,
+            )
+
+            logprob_response = ChatCompletionLogprobs(content=[token_prob_response])
+
+        choice = ChatCompletionStreamChoice(
+            index=index,
+            delta=message,
+            logprobs=logprob_response,
+        )
+
+        choices.append(choice)
+
+    chunk = ChatCompletionStreamChunk(
+        id=f"chatcmpl-{request_id}",
+        choices=choices,
+        model=unwrap(model_name, ""),
+        usage=usage_stats,
+    )
+
+    return chunk
+
+
+def _build_tool_call_chunks(
+    tool_calls: List[ToolCall],
+    request_id: str,
+    model_name: str,
+) -> List[ChatCompletionStreamChunk]:
+    """Build the OpenAI-standard streaming sequence for tool calls.
+
+    Emits two chunks:
+      1. Tool-call chunk: role="assistant", complete tool_calls with
+         index/id/type/name/arguments (all data in one chunk).
+      2. Finish chunk: empty delta, finish_reason="tool_calls".
+
+    Complete arguments are sent in a single chunk rather than streamed
+    incrementally, which is valid per OpenAI's spec (clients concatenate
+    argument strings across deltas) and maximizes compatibility with
+    clients that may not implement multi-chunk tool-call assembly.
+
+    The tool_calls are placed directly into a ChatCompletionMessage
+    (not a raw dict) so Pydantic validates them as ToolCall objects
+    with the index field preserved (ToolCall declares index as Optional[int]).
+    """
+    chunk_id = f"chatcmpl-{request_id}"
+
+    # Set index on each tool call for streaming
+    for idx, tc in enumerate(tool_calls):
+        tc.index = idx
+
+    # Chunk 1: Complete tool call data
+    tool_call_message = ChatCompletionMessage(
+        role="assistant",
+        tool_calls=tool_calls,
+    )
+    tool_chunk = ChatCompletionStreamChunk(
+        id=chunk_id,
+        choices=[
+            ChatCompletionStreamChoice(
+                index=0,
+                delta=tool_call_message,
+                finish_reason=None,
+            )
+        ],
+        model=model_name,
+    )
+
+    # Chunk 2: Finish signal
+    # Use model_construct to prevent Pydantic's smart Union from
+    # coercing the empty dict {} into ChatCompletionMessage(role="user")
+    finish_choice = ChatCompletionStreamChoice.model_construct(
+        index=0,
+        delta={},
+        finish_reason="tool_calls",
+        logprobs=None,
+    )
+    finish_chunk = ChatCompletionStreamChunk(
+        id=chunk_id,
+        choices=[finish_choice],
+        model=model_name,
+    )
+
+    return [tool_chunk, finish_chunk]
+
+
+async def _append_template_metadata(data: ChatCompletionRequest, template_vars: dict):
+    """Adding metadata is a one-time process."""
+
+    template_metadata = await model.container.prompt_template.extract_metadata(
+        template_vars
+    )
+
+    # Stop strings
+    if isinstance(data.stop, str):
+        data.stop = [data.stop] + template_metadata.stop_strings
+    else:
+        data.stop.extend(template_metadata.stop_strings)
+
+    # if a tool start is present, append it to stopping strings
+    if template_metadata.tool_start:
+        data.stop.append(template_metadata.tool_start)
 
 
 async def format_messages_with_template(
@@ -523,9 +811,12 @@ async def stream_generate_chat_completion(
     Generator for the generation process.
     """
 
+    abort_event = asyncio.Event()
     gen_queue = asyncio.Queue()
     gen_tasks: List[asyncio.Task] = []
-    return_usage = data.stream_options and data.stream_options.include_usage
+    tool_start = model.container.prompt_template.metadata.tool_start
+    tool_call_format = model.container.prompt_template.metadata.tool_call_format
+    disconnect_task = asyncio.create_task(request_disconnect_loop(request))
 
     try:
         xlogger.info(
@@ -549,59 +840,121 @@ async def stream_generate_chat_completion(
             task_gen_params = data.model_copy(deep=True)
             request_id = _parse_gen_request_id(data.n, request.state.id, idx)
             gen_task = asyncio.create_task(
-                _chat_stream_collector(
+                _stream_collector(
                     idx,
                     gen_queue,
                     request_id,
                     prompt,
                     task_gen_params,
-                    start_in_reasoning_mode,
+                    abort_event,
                     mm_embeddings=embeddings,
-                    streaming_mode=True,
-                    disconnect_handler=disconnect_handler,
                 )
             )
             gen_tasks.append(gen_task)
 
         # Consumer loop
         while True:
-            generation = await gen_queue.get()
+            # Fast path: items already queued — no task overhead
+            if not gen_queue.empty():
+                generation = gen_queue.get_nowait()
+            else:
+                # Slow path: queue empty — race get against disconnect
+                get_task = asyncio.create_task(gen_queue.get())
+                done, _ = await asyncio.wait(
+                    [get_task, disconnect_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if disconnect_task in done:
+                    get_task.cancel()
+                    raise CancelledError()
+                generation = get_task.result()
+
+            if disconnect_task.done():
+                raise CancelledError()
+
+            # Handle options if a tool model is present
+            if tool_start and data.tool_choice != "none":
+                if "stop_str" in generation:
+                    generations = await generate_tool_calls(
+                        prompt,
+                        embeddings,
+                        data,
+                        [generation],
+                        request,
+                    )
+
+                    # Only one generation present in this case
+                    generation = generations[0]
+
+                    # Emit proper three-phase tool-call streaming sequence
+                    if "tool_calls" in generation:
+                        tool_calls_raw = generation["tool_calls"]
+                        named_func = ""
+                        if isinstance(data.tool_choice, NamedToolChoice):
+                            named_func = data.tool_choice.function.name
+                        parsed = ToolCallProcessor.parse(
+                            tool_calls_raw, format=tool_call_format, named_func=named_func
+                        )
+
+                        if parsed:
+                            for tc_chunk in _build_tool_call_chunks(
+                                parsed,
+                                request.state.id,
+                                model_path.name,
+                            ):
+                                yield _serialize_stream_chunk(tc_chunk)
+
+                            # Handle completion and usage after tool calls
+                            if (
+                                all(task.done() for task in gen_tasks)
+                                and gen_queue.empty()
+                            ):
+                                if (
+                                    data.stream_options
+                                    and data.stream_options.include_usage
+                                ):
+                                    usage_chunk = _create_stream_chunk(
+                                        request.state.id,
+                                        generation,
+                                        model_path.name,
+                                        is_usage_chunk=True,
+                                    )
+                                    yield _serialize_stream_chunk(usage_chunk)
+
+                                xlogger.info(
+                                    "Finished chat completion streaming "
+                                    f"request {request.state.id}"
+                                )
+                                yield "[DONE]"
+                                break
+                            continue
+
+                elif "text" in generation:
+                    current_generation_text += generation["text"]
 
             # Stream collector will push an exception to the queue if it fails
             if isinstance(generation, Exception):
                 raise generation
 
             # Create and serialize chunk
-            chunk, _, finish_reason, is_empty = _compose_serialize_stream_chunk(
+            response = _create_stream_chunk(
                 request.state.id,
                 generation,
                 model_path.name,
-                return_usage and remaining_n == 1,
             )
-            if not is_empty:
-                yield chunk
-
-            # Send usage chunk on completing last choice
-            if finish_reason:
-                remaining_n -= 1
-                if return_usage:
-                    usage_stats_list.append(get_usage_stats(generation))
-                    if remaining_n == 0:
-                        usage_chunk, usage_chunk_dict = _compose_serialize_stream_usage_chunk(
-                            request.state.id,
-                            aggregate_usage_stats(usage_stats_list),
-                            generation["index"],
-                            finish_reason,
-                            model_path.name,
-                        )
-                        yield usage_chunk
-                        xlogger.debug(
-                            f"Sent UsageStats for request {request.state.id}",
-                            usage_chunk_dict,
-                        )
+            yield _serialize_stream_chunk(response)
 
             # Check if all tasks are completed
             if all(task.done() for task in gen_tasks) and gen_queue.empty():
+                # Send a usage chunk
+                if data.stream_options and data.stream_options.include_usage:
+                    usage_chunk = _create_stream_chunk(
+                        request.state.id,
+                        generation,
+                        model_path.name,
+                        is_usage_chunk=True,
+                    )
+                    yield _serialize_stream_chunk(usage_chunk)
                 xlogger.info(f"Finished chat completion streaming request {request.state.id}")
                 yield "[DONE]"
                 break
@@ -626,7 +979,8 @@ async def generate_chat_completion(
     disconnect_handler: DisconnectHandler,
 ):
     gen_tasks: List[asyncio.Task] = []
-    return_usage = data.stream_options and data.stream_options.include_usage
+    tool_start = model.container.prompt_template.metadata.tool_start
+    tool_call_format = model.container.prompt_template.metadata.tool_call_format
 
     try:
         xlogger.info(
@@ -638,38 +992,38 @@ async def generate_chat_completion(
             },
         )
 
-        # Determine if we're generating content or reasoning_content to start with
-        start_in_reasoning_mode = model.container.reasoning and _start_in_reasoning_mode(prompt)
-
         # Create a stream collector for each choice
         for idx in range(0, data.n):
             task_gen_params = data.model_copy(deep=True)
             request_id = _parse_gen_request_id(data.n, request.state.id, idx)
             gen_task = asyncio.create_task(
-                _chat_stream_collector(
-                    idx,
-                    None,
+                model.container.generate(
                     request_id,
                     prompt,
-                    task_gen_params,
-                    start_in_reasoning_mode,
+                    data,
                     mm_embeddings=embeddings,
-                    streaming_mode=False,
-                    disconnect_handler=disconnect_handler,
                 )
             )
             gen_tasks.append(gen_task)
 
-        await asyncio.wait([*gen_tasks])
+        generations = await asyncio.gather(*gen_tasks)
 
-        # Create response
-        generations = []
-        for task in gen_tasks:
-            r = task.result()
-            if isinstance(r, Exception):
-                raise r
-            generations.append(r)
-        response = _compose_response(request.state.id, generations, model_path.name, return_usage)
+        # Check all the generations and see if a tool call is required
+        force_tool_pass = data.tool_choice == "required" or isinstance(
+            data.tool_choice, NamedToolChoice
+        )
+        if tool_start or force_tool_pass:
+            generations = await generate_tool_calls(
+                prompt, embeddings, data, generations, request
+            )
+        
+        response = _create_response(
+            request.state.id,
+            generations,
+            model_path.name,
+            tool_call_format=tool_call_format,
+            tool_choice=data.tool_choice,
+        )
 
         xlogger.info(f"Finished chat completion request {request.state.id}", {"response": response})
         return response
@@ -688,3 +1042,111 @@ async def generate_chat_completion(
 
     finally:
         await disconnect_handler.cleanup()
+
+
+async def generate_tool_calls(
+    prompt: str,
+    embeddings: MultimodalEmbeddingWrapper,
+    data: ChatCompletionRequest,
+    generations: List[str],
+    request: Request,
+):
+    gen_tasks: List[asyncio.Task] = []
+    tool_start = model.container.prompt_template.metadata.tool_start
+    tool_call_format = model.container.prompt_template.metadata.tool_call_format
+    tool_choice = data.tool_choice
+
+    if tool_choice == "none":
+        return generations
+
+    # Tracks which generations asked for a tool call
+    tool_idx: List[int] = []
+
+    # Copy to make sure the parent JSON schema doesn't get modified
+    tool_data = data.model_copy(deep=True)
+
+    if tool_call_format in ("xml", "auto"):
+        # XML / auto mode: let the model generate its natural output
+        # without JSON schema constraint
+        xlogger.debug(
+            f"generate_tool_calls: Using '{tool_call_format}' mode "
+            f"(no JSON schema constraint)"
+        )
+
+        # Remove tool_start from stop strings so the model can emit
+        # multiple sequential <tool_call> blocks without stopping early
+        if (
+            tool_start
+            and isinstance(tool_data.stop, list)
+            and tool_start in tool_data.stop
+        ):
+            tool_data.stop = [s for s in tool_data.stop if s != tool_start]
+            xlogger.debug(
+                f"generate_tool_calls: Removed '{tool_start}' from "
+                f"second-pass stop strings"
+            )
+    else:
+        # JSON mode: constrained generation (existing behavior)
+        tool_data.json_schema = TOOL_CALL_SCHEMA
+
+    for idx, gen in enumerate(generations):
+        stop_str = gen.get("stop_str")
+        should_generate = stop_str == tool_start
+
+        # Force tool generation if tool_choice requires it
+        if not should_generate and (
+            tool_choice == "required" or isinstance(tool_choice, NamedToolChoice)
+        ):
+            should_generate = True
+
+        if not should_generate:
+            continue
+
+        xlogger.info(
+            f"Detected tool call in chat completion request "
+            f"{request.state.id} (format={tool_call_format})"
+        )
+
+        # Build per-generation prompt (avoid mutating shared prompt)
+        tool_prompt = prompt
+        precursor_text = gen.get("full_text")
+        if precursor_text:
+            tool_prompt = tool_prompt + precursor_text
+
+        # For XML/auto mode: append tool_start back to prompt.
+        # The stop string was consumed by the first pass and not included
+        # in full_text, but the model expects to continue after <tool_call>.
+        # Include a trailing newline to match the canonical template format.
+        if tool_call_format in ("xml", "auto") and tool_start:
+            tool_prompt = tool_prompt + tool_start + "\n"
+
+        gen_request_id = gen.get("request_id")
+        tool_request_id = f"{gen_request_id}-tool"
+
+        gen_tasks.append(
+            asyncio.create_task(
+                model.container.generate(
+                    tool_request_id,
+                    tool_prompt,
+                    tool_data,
+                    mm_embeddings=embeddings,
+                )
+            )
+        )
+
+        tool_idx.append(idx)
+
+    if len(tool_idx) > 0:
+        tool_calls = await asyncio.gather(*gen_tasks)
+
+        # Map tool calls to their appropriate generation
+        for gen_idx, tool_call in zip(tool_idx, tool_calls, strict=True):
+            raw_text = tool_call["text"]
+
+            if tool_call_format in ("xml", "auto"):
+                # Prepend tool_start to reconstruct complete XML for parser
+                raw_text = tool_start + "\n" + raw_text
+
+            generations[gen_idx]["tool_calls"] = raw_text
+
+    return generations
