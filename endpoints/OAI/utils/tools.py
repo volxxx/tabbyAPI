@@ -438,7 +438,7 @@ class ToolCallProcessor:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def parse(tool_calls_str: str, format: str = "json") -> List[ToolCall]:
+    def parse(tool_calls_str: str, format: str = "json", named_func: str = "") -> List[ToolCall]:
         """Dispatch tool call parsing to the appropriate format handler.
 
     Args:
@@ -455,14 +455,22 @@ class ToolCallProcessor:
             elif format == "auto":
                 return ToolCallProcessor.from_auto(tool_calls_str)
             else:
-                return ToolCallProcessor.from_json(tool_calls_str)
+                parsedToolCalls =  ToolCallProcessor.from_json(tool_calls_str)
+            if named_func.strip():
+                tool_calls_cnt = len(parsedToolCalls)
+                parsedToolCalls = [tc for tc in parsedToolCalls if tc.function.name == named_func]
+                if not parsedToolCalls:
+                    xlogger.warning(
+                        f"filter_by_name: No tool calls matched '{named_func}' "
+                        f"(had {tool_calls_cnt} call(s))"
+                    )
         except Exception as e:
             xlogger.error(
                 f"ToolCallProcessor.parse: Failed to parse tool calls "
                 f"(format={format}): {e}"
             )
             return []
-
+        return parsedToolCalls
     # ------------------------------------------------------------------
     # Filtering
     # ------------------------------------------------------------------
