@@ -302,6 +302,7 @@ class ToolCallProcessor:
 
         Handles:
           - Wrapped: <tool_call><function=name>...</function></tool_call>
+          - GLM Wrapped: <tool_call>func_name<arg_key>key</arg_key><arg_value>value</arg_value>...</tool_call>
           - Bare: <function=name>...</function> (missing wrapper)
           - Multiple sequential tool call blocks
           - <think> blocks (stripped)
@@ -309,6 +310,7 @@ class ToolCallProcessor:
           - Missing </parameter> closing tags
         """
         xlogger.debug(f"XML Parser: Parsing tool calls ({len(raw_text)} chars)")
+        tool_calls = []
 
         # Stage 1: Strip think blocks
         text = _strip_think_blocks(raw_text)
@@ -347,11 +349,41 @@ class ToolCallProcessor:
                 function_blocks.append((func_match.group(1), func_match.group(2)))
 
         if not function_blocks:
-            xlogger.warning("XML Parser: No <function=...> blocks found")
-            return []
+            # Try GLM-style format: <tool_call>func_name<arg_key>key</arg_key><arg_value>value</arg_value>...</tool_call>
+            glm_tool_call_pattern = r'<tool_call>([^<]+)((?:<arg_key>.*?</arg_key>\s*<arg_value>.*?</arg_value>)*)\s*</tool_call>'
+            glm_arg_pattern = r'<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>'
+
+            glm_matches = re.findall(glm_tool_call_pattern, text, re.DOTALL)
+
+            if glm_matches:
+                xlogger.debug("XML Parser: Found GLM style function block")
+                for tool_name, args_block in glm_matches:
+                    parameters = {}
+                    params = re.findall(glm_arg_pattern, args_block, re.DOTALL)
+
+                    for param_name, param_value in params:
+                        param_name = param_name.strip()
+                        param_value = param_value.strip()
+                        try:
+                            parsed_value = json.loads(param_value)
+                            parameters[param_name] = parsed_value
+                        except json.JSONDecodeError:
+                            parameters[param_name] = param_value
+
+                    tool_call_dict = {
+                        "function": {
+                            "name": tool_name.strip(),
+                            "arguments": json.dumps(parameters),
+                        }
+                    }
+
+                    tool_calls.append(ToolCall(**tool_call_dict))
+            else:
+                xlogger.warning("XML Parser: No <function=...> blocks found")
+
+            return tool_calls
 
         # Stage 4: Parse each function block into a ToolCall
-        tool_calls = []
         for func_name_raw, func_body in function_blocks:
             func_name = func_name_raw.strip()
 
