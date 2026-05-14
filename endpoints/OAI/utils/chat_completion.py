@@ -34,7 +34,6 @@ from endpoints.OAI.utils.completion import _parse_gen_request_id, _stream_collec
 from endpoints.OAI.types.tools import NamedToolChoice, ToolCall
 from endpoints.OAI.utils.tools import (
     get_toolcall_tags,
-    parse_toolcalls,
     ToolCallProcessor,
     TOOL_CALL_SCHEMA
 )
@@ -602,7 +601,7 @@ def _parse_tool_calls(
     deltas, which we don't do here.)
     """
 
-    parsed = parse_toolcalls(text, tool_format)
+    parsed = ToolCallProcessor.parse(text, tool_format)
     for tc_idx, p in enumerate(parsed):
         p.index = tc_idx
     dumped = [p.model_dump(mode="json") for p in parsed]
